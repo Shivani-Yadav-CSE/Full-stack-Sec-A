@@ -1,51 +1,100 @@
-require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
-const path = require("path");
-const connectDB = require("./config/db");
-const { errorHandler, notFound } = require("./middleware/errorHandler");
-
-const authRoutes = require("./routes/authRoutes");
-const eventRoutes = require("./routes/eventRoutes");
-const resourceRoutes = require("./routes/resourceRoutes");
-const dashboardRoutes = require("./routes/dashboardRoutes");
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 
 const app = express();
-
-// Connect to MongoDB (skipped automatically when required from tests - see tests/setup)
-if (process.env.NODE_ENV !== "test") {
-  connectDB();
-}
-
-// Middleware
-app.use(cors({ origin: process.env.CLIENT_URL || "*", credentials: true }));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// Serve uploaded files statically is intentionally NOT exposed here -
-// downloads go through the authenticated /api/resources/:id/download route instead.
+const JWT_SECRET = process.env.JWT_SECRET || 'my_super_secret_key';
+const PORT = process.env.PORT || 3000;
 
-// Health check
-app.get("/api/health", (req, res) => {
-  res.status(200).json({ status: "ok", message: "CampusConnect API is running" });
+// In-memory user store: { username: hashedPassword }
+const users = new Map();
+
+// Handle malformed JSON bodies gracefully
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ error: 'Invalid input' });
+  }
+  next(err);
 });
 
-// Routes
-app.use("/api/auth", authRoutes);
-app.use("/api/events", eventRoutes);
-app.use("/api/resources", resourceRoutes);
-app.use("/api/dashboard", dashboardRoutes);
+// ---------- POST /register ----------
+app.post('/register', async (req, res) => {
+  const { username, password } = req.body || {};
 
-// 404 + error handling (must be last)
-app.use(notFound);
-app.use(errorHandler);
+  if (
+    typeof username !== 'string' ||
+    username.trim() === '' ||
+    typeof password !== 'string' ||
+    password.length < 6
+  ) {
+    return res.status(400).json({ error: 'Invalid input' });
+  }
 
-const PORT = process.env.PORT || 5000;
+  if (users.has(username)) {
+    return res.status(409).json({ error: 'Username already exists' });
+  }
 
-if (process.env.NODE_ENV !== "test") {
+  const hashedPassword = await bcrypt.hash(password, 10);
+  users.set(username, hashedPassword);
+
+  return res.status(201).json({ message: 'User registered' });
+});
+
+// ---------- POST /login ----------
+app.post('/login', async (req, res) => {
+  const { username, password } = req.body || {};
+
+  if (typeof username !== 'string' || typeof password !== 'string') {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  const storedHash = users.get(username);
+  if (!storedHash) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  const match = await bcrypt.compare(password, storedHash);
+  if (!match) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '1h' });
+  return res.status(200).json({ token });
+});
+
+// ---------- Auth Middleware ----------
+function authenticate(req, res, next) {
+  const authHeader = req.headers['authorization'];
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    // Malformed, invalid signature, or expired token
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
+// ---------- GET /profile ----------
+app.get('/profile', authenticate, (req, res) => {
+  return res.status(200).json({ username: req.user.username });
+});
+
+if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`CampusConnect API listening on port ${PORT}`);
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
-module.exports = app; // exported for supertest
+module.exports = app;
